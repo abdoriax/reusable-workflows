@@ -11,13 +11,6 @@ on:
         description: 'The git ref (branch, tag, or SHA) to checkout for building the application. Defaults to the value of triggering_ref if not specified.'
         required: false
         type: string
-    outputs:
-      image_tag:
-        description: 'The Docker image tag that was built (e.g., v1.0.0).'
-        value: ${{ jobs.build_and_push_docker_image.outputs.image_tag }}
-      image_name:
-        description: 'The full Docker image name that was built (e.g., ghcr.io/owner/repo).'
-        value: ${{ jobs.build_and_push_docker_image.outputs.image_name }}
 
 permissions:
   contents: write
@@ -33,7 +26,7 @@ jobs:
     env:
       REPO_NAME: ${{ github.event.repository.name }}
     steps:
-      - name: Checkout Repository for Build
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_checkout_ref || inputs.triggering_ref }}
@@ -70,18 +63,46 @@ jobs:
         id: image_meta_output
         run: echo "version=${{ steps.meta.outputs.version }}" >> $GITHUB_OUTPUT
 
-  update_manifest_dev:
-    name: Update Development Manifest
-    needs: build_and_push_docker_image
-    if: contains(inputs.triggering_ref, 'alpha')
+  determine_target_environments:
+    name: Determine Target Environments
     runs-on: ubuntu-latest
-    environment:
-      name: development
-    env:
-      MANIFEST_FILE: "./k8s/overlays/development/deployment.yaml"
-      GIT_COMMIT_MESSAGE: "Update dev deployment image to ${{ needs.build_and_push_docker_image.outputs.image_tag }}"
+    outputs:
+      matrix_config: ${{ steps.generate_matrix.outputs.matrix_config }}
     steps:
-      - name: Checkout Repository (main branch for manifest update)
+      - name: Generate matrix configuration
+        id: generate_matrix
+        env:
+          TRIGGERING_REF: ${{ inputs.triggering_ref }}
+        run: |
+          echo "Determining matrix for ref: $TRIGGERING_REF"
+          generated_matrix_json='{"include":[]}'
+
+          if [[ "$TRIGGERING_REF" == *alpha* ]]; then
+            generated_matrix_json='{"include":[{"target_env":"development"}]}'
+          elif [[ "$TRIGGERING_REF" == *beta* ]]; then
+            generated_matrix_json='{"include":[{"target_env":"staging"}]}'
+          elif [[ "$TRIGGERING_REF" != *alpha* ]] && [[ "$TRIGGERING_REF" != *beta* ]]; then
+            generated_matrix_json='{"include":[{"target_env":"production"}]}'
+          fi
+          
+          echo "Generated matrix config: $generated_matrix_json"
+          echo "matrix_config=$generated_matrix_json" >> "$GITHUB_OUTPUT"
+
+  update_manifest:
+    name: Update Manifest for ${{ matrix.target_env }}
+    needs:
+      - build_and_push_docker_image
+      - determine_target_environments
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.determine_target_environments.outputs.matrix_config) }}
+    
+    environment:
+      name: ${{ matrix.target_env }}
+
+    steps:
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -89,145 +110,69 @@ jobs:
 
       - name: Install yq
         run: |
-            sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -O /usr/bin/yq
-            sudo chmod +x /usr/bin/yq
-            yq --version
+          sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -O /usr/bin/yq
+          sudo chmod +x /usr/bin/yq
+          yq --version
+
+      - name: Set environment-specific variables
+        id: env_specifics
+        run: |
+          TARGET_ENV_NAME="${{ matrix.target_env }}"
+          MANIFEST_FILE_PATH=""
+          COMMIT_MESSAGE_ENV_SLUG=""
+
+          if [ "$TARGET_ENV_NAME" == "development" ]; then
+            MANIFEST_FILE_PATH="./k8s/overlays/development/deployment.yaml"
+            COMMIT_MESSAGE_ENV_SLUG="dev"
+          elif [ "$TARGET_ENV_NAME" == "staging" ]; then
+            MANIFEST_FILE_PATH="./k8s/overlays/staging/deployment.yaml"
+            COMMIT_MESSAGE_ENV_SLUG="staging"
+          elif [ "$TARGET_ENV_NAME" == "production" ]; then
+            MANIFEST_FILE_PATH="./k8s/overlays/production/deployment.yaml"
+            COMMIT_MESSAGE_ENV_SLUG="production"
+          else
+            echo "Error: Unknown target_env or job run unexpectedly: $TARGET_ENV_NAME"
+            exit 1
+          fi
+          echo "MANIFEST_FILE=${MANIFEST_FILE_PATH}" >> $GITHUB_OUTPUT
+          echo "COMMIT_SLUG=${COMMIT_MESSAGE_ENV_SLUG}" >> $GITHUB_OUTPUT
 
       - name: Update Kubernetes Manifest
         env:
+          MANIFEST_FILE: ${{ steps.env_specifics.outputs.MANIFEST_FILE }}
           NEW_IMAGE_WITH_TAG: "${{ needs.build_and_push_docker_image.outputs.image_name }}:${{ needs.build_and_push_docker_image.outputs.image_tag }}"
         run: |
-          echo "Triggering ref for this run: ${{ inputs.triggering_ref }}"
-          echo "Updating $MANIFEST_FILE with image: $NEW_IMAGE_WITH_TAG"
+          echo "Triggering Git ref from input: ${{ inputs.triggering_ref }}"
+          echo "Target environment: ${{ matrix.target_env }}"
+          echo "Updating manifest $MANIFEST_FILE with image $NEW_IMAGE_WITH_TAG"
+          
           if [ ! -f "$MANIFEST_FILE" ]; then
-            echo "Error: $MANIFEST_FILE not found"
+            echo "Error: Manifest file $MANIFEST_FILE not found!"
             exit 1
           fi
+
           if ! yq e '.spec.template.spec.containers[0]' "$MANIFEST_FILE" > /dev/null; then
             echo "Error: No container found at .spec.template.spec.containers[0] in $MANIFEST_FILE"
             exit 1
           fi
+          
           yq e '.spec.template.spec.containers[0].image = strenv(NEW_IMAGE_WITH_TAG)' -i "$MANIFEST_FILE"
-          echo "Manifest content after update:"
+          echo "Manifest content after update for ${{ matrix.target_env }}:"
           cat "$MANIFEST_FILE"
 
       - name: Commit and Push Manifest Changes
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add "$MANIFEST_FILE"
-          if git diff --staged --quiet; then
-            echo "No changes to commit to $MANIFEST_FILE."
-          else
-            git commit -m "${{ env.GIT_COMMIT_MESSAGE }}"
-            git push origin main
-            echo "Pushed manifest changes for development to main branch."
-          fi
-
-  update_manifest_staging:
-    name: Update Staging Manifest
-    needs: build_and_push_docker_image
-    if: contains(inputs.triggering_ref, 'beta')
-    runs-on: ubuntu-latest
-    environment:
-      name: staging
-    env:
-      MANIFEST_FILE: "./k8s/overlays/staging/deployment.yaml"
-      GIT_COMMIT_MESSAGE: "Update staging deployment image to ${{ needs.build_and_push_docker_image.outputs.image_tag }}"
-    steps:
-      - name: Checkout Repository (main branch for manifest update)
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main
-
-      - name: Install yq
-        run: |
-            sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -O /usr/bin/yq
-            sudo chmod +x /usr/bin/yq
-            yq --version
-
-      - name: Update Kubernetes Manifest
         env:
-          NEW_IMAGE_WITH_TAG: "${{ needs.build_and_push_docker_image.outputs.image_name }}:${{ needs.build_and_push_docker_image.outputs.image_tag }}"
-        run: |
-          echo "Triggering ref for this run: ${{ inputs.triggering_ref }}"
-          echo "Updating $MANIFEST_FILE with image: $NEW_IMAGE_WITH_TAG"
-          if [ ! -f "$MANIFEST_FILE" ]; then
-            echo "Error: $MANIFEST_FILE not found"
-            exit 1
-          fi
-          if ! yq e '.spec.template.spec.containers[0]' "$MANIFEST_FILE" > /dev/null; then
-            echo "Error: No container found at .spec.template.spec.containers[0] in $MANIFEST_FILE"
-            exit 1
-          fi
-          yq e '.spec.template.spec.containers[0].image = strenv(NEW_IMAGE_WITH_TAG)' -i "$MANIFEST_FILE"
-          echo "Manifest content after update:"
-          cat "$MANIFEST_FILE"
-
-      - name: Commit and Push Manifest Changes
+          MANIFEST_FILE: ${{ steps.env_specifics.outputs.MANIFEST_FILE }}
+          GIT_COMMIT_MESSAGE: "Update ${{ steps.env_specifics.outputs.COMMIT_SLUG }} deployment image to ${{ needs.build_and_push_docker_image.outputs.image_tag }}"
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add "$MANIFEST_FILE"
+          
           if git diff --staged --quiet; then
-            echo "No changes to commit to $MANIFEST_FILE."
+            echo "No changes to commit to $MANIFEST_FILE for ${{ matrix.target_env }}."
           else
-            git commit -m "${{ env.GIT_COMMIT_MESSAGE }}"
-            git push origin main
-            echo "Pushed manifest changes for staging to main branch."
-          fi
-
-  update_manifest_production:
-    name: Update Production Manifest
-    needs: build_and_push_docker_image
-    if: "!contains(inputs.triggering_ref, 'alpha') && !contains(inputs.triggering_ref, 'beta')"
-    runs-on: ubuntu-latest
-    environment:
-      name: production
-    env:
-      MANIFEST_FILE: "./k8s/overlays/production/deployment.yaml"
-      GIT_COMMIT_MESSAGE: "Update production deployment image to ${{ needs.build_and_push_docker_image.outputs.image_tag }}"
-    steps:
-      - name: Checkout Repository (main branch for manifest update)
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main
-
-      - name: Install yq
-        run: |
-            sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -O /usr/bin/yq
-            sudo chmod +x /usr/bin/yq
-            yq --version
-
-      - name: Update Kubernetes Manifest
-        env:
-          NEW_IMAGE_WITH_TAG: "${{ needs.build_and_push_docker_image.outputs.image_name }}:${{ needs.build_and_push_docker_image.outputs.image_tag }}"
-        run: |
-          echo "Triggering ref for this run: ${{ inputs.triggering_ref }}"
-          echo "Updating $MANIFEST_FILE with image: $NEW_IMAGE_WITH_TAG"
-          if [ ! -f "$MANIFEST_FILE" ]; then
-            echo "Error: $MANIFEST_FILE not found"
-            exit 1
-          fi
-          if ! yq e '.spec.template.spec.containers[0]' "$MANIFEST_FILE" > /dev/null; then
-            echo "Error: No container found at .spec.template.spec.containers[0] in $MANIFEST_FILE"
-            exit 1
-          fi
-          yq e '.spec.template.spec.containers[0].image = strenv(NEW_IMAGE_WITH_TAG)' -i "$MANIFEST_FILE"
-          echo "Manifest content after update:"
-          cat "$MANIFEST_FILE"
-
-      - name: Commit and Push Manifest Changes
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add "$MANIFEST_FILE"
-          if git diff --staged --quiet; then
-            echo "No changes to commit to $MANIFEST_FILE."
-          else
-            git commit -m "${{ env.GIT_COMMIT_MESSAGE }}"
-            git push origin main
-            echo "Pushed manifest changes for production to main branch."
+            git commit -m "${GIT_COMMIT_MESSAGE}"
+            git push origin main 
+            echo "Pushed manifest changes for ${{ matrix.target_env }} to 'main' branch."
           fi
