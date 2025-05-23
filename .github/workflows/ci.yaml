@@ -63,52 +63,58 @@ jobs:
         id: image_meta_output
         run: echo "version=${{ steps.meta.outputs.version }}" >> $GITHUB_OUTPUT
 
+  determine_target_environments:
+    name: Determine Target Environments
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_config: ${{ steps.generate_matrix.outputs.matrix_config }}
+    steps:
+      - name: Generate matrix configuration
+        id: generate_matrix
+        env:
+          TRIGGERING_REF: ${{ inputs.triggering_ref }}
+        run: |
+          echo "Determining matrix for ref: $TRIGGERING_REF"
+          generated_matrix_json='{"include":[]}'
+
+          if [[ "$TRIGGERING_REF" == *alpha* ]]; then
+            generated_matrix_json='{"include":[{"target_env":"development"}]}'
+          elif [[ "$TRIGGERING_REF" == *beta* ]]; then
+            generated_matrix_json='{"include":[{"target_env":"staging"}]}'
+          elif [[ "$TRIGGERING_REF" != *alpha* ]] && [[ "$TRIGGERING_REF" != *beta* ]]; then
+            generated_matrix_json='{"include":[{"target_env":"production"}]}'
+          fi
+          
+          echo "Generated matrix config: $generated_matrix_json"
+          echo "matrix_config=$generated_matrix_json" >> "$GITHUB_OUTPUT"
+
   update_manifest:
     name: Update Manifest for ${{ matrix.target_env }}
-    needs: build_and_push_docker_image
+    needs:
+      - build_and_push_docker_image
+      - determine_target_environments
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        target_env: [development, staging, production]
+      fail-fast: false
+      matrix: ${{ fromJson(needs.determine_target_environments.outputs.matrix_config) }}
     
     environment:
       name: ${{ matrix.target_env }}
 
     steps:
-      - name: Determine if job should run for ${{ matrix.target_env }}
-        id: condition_check
-        env:
-          TRIGGERING_REF: ${{ inputs.triggering_ref }}
-          TARGET_ENV: ${{ matrix.target_env }}
-        run: |
-          echo "Evaluating condition for TARGET_ENV: $TARGET_ENV based on TRIGGERING_REF: $TRIGGERING_REF"
-          should_run="false"
-          if [ "$TARGET_ENV" == "development" ] && [[ "$TRIGGERING_REF" == *alpha* ]]; then
-            should_run="true"
-          elif [ "$TARGET_ENV" == "staging" ] && [[ "$TRIGGERING_REF" == *beta* ]]; then
-            should_run="true"
-          elif [ "$TARGET_ENV" == "production" ] && [[ "$TRIGGERING_REF" != *alpha* ]] && [[ "$TRIGGERING_REF" != *beta* ]]; then
-            should_run="true"
-          fi
-          echo "Decision: should_run=$should_run"
-          echo "should_run=$should_run" >> $GITHUB_OUTPUT
-
       - name: Checkout Repository
-        if: steps.condition_check.outputs.should_run == 'true'
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: main
 
       - name: Install yq
-        if: steps.condition_check.outputs.should_run == 'true'
         run: |
           sudo wget https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -O /usr/bin/yq
           sudo chmod +x /usr/bin/yq
           yq --version
 
       - name: Set environment-specific variables
-        if: steps.condition_check.outputs.should_run == 'true'
         id: env_specifics
         run: |
           TARGET_ENV_NAME="${{ matrix.target_env }}"
@@ -125,14 +131,13 @@ jobs:
             MANIFEST_FILE_PATH="./k8s/overlays/production/deployment.yaml"
             COMMIT_MESSAGE_ENV_SLUG="production"
           else
-            echo "Error: Unknown target_env: $TARGET_ENV_NAME"
+            echo "Error: Unknown target_env or job run unexpectedly: $TARGET_ENV_NAME"
             exit 1
           fi
           echo "MANIFEST_FILE=${MANIFEST_FILE_PATH}" >> $GITHUB_OUTPUT
           echo "COMMIT_SLUG=${COMMIT_MESSAGE_ENV_SLUG}" >> $GITHUB_OUTPUT
 
       - name: Update Kubernetes Manifest
-        if: steps.condition_check.outputs.should_run == 'true'
         env:
           MANIFEST_FILE: ${{ steps.env_specifics.outputs.MANIFEST_FILE }}
           NEW_IMAGE_WITH_TAG: "${{ needs.build_and_push_docker_image.outputs.image_name }}:${{ needs.build_and_push_docker_image.outputs.image_tag }}"
@@ -156,7 +161,6 @@ jobs:
           cat "$MANIFEST_FILE"
 
       - name: Commit and Push Manifest Changes
-        if: steps.condition_check.outputs.should_run == 'true'
         env:
           MANIFEST_FILE: ${{ steps.env_specifics.outputs.MANIFEST_FILE }}
           GIT_COMMIT_MESSAGE: "Update ${{ steps.env_specifics.outputs.COMMIT_SLUG }} deployment image to ${{ needs.build_and_push_docker_image.outputs.image_tag }}"
