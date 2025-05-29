@@ -86,9 +86,7 @@ jobs:
 
   update_manifest:
     name: Update Manifest for ${{ matrix.target_env }}
-    needs:
-      - build_and_push_docker_image
-      - determine_target_environments
+    needs: [build_and_push_docker_image, determine_target_environments]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
