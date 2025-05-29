@@ -7,10 +7,6 @@ on:
         description: 'The git ref name (e.g., v1.0.0, v1.0.0-alpha, or a simulated tag for testing) that is initiating the process. Used for tag parsing and Docker metadata.'
         required: true
         type: string
-      source_checkout_ref:
-        description: 'The git ref (branch, tag, or SHA) to checkout for building the application. Defaults to the value of triggering_ref if not specified.'
-        required: false
-        type: string
 
 permissions:
   contents: write
@@ -29,7 +25,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_checkout_ref || inputs.triggering_ref }}
+          ref: ${{ inputs.triggering_ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
